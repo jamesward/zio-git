@@ -40,6 +40,22 @@ extension (id: ObjectId)
 
 given CanEqual[ObjectId, ObjectId] = CanEqual.derived
 
+/** A hexadecimal abbreviation of an object id. Git requires at least four
+ *  characters before attempting unique-prefix resolution. */
+opaque type ObjectIdPrefix = String
+
+object ObjectIdPrefix:
+  def parse(raw: String): Option[ObjectIdPrefix] =
+    val value = raw.trim.toLowerCase
+    Option.when(
+      value.length >= 4 && value.length < 40 &&
+        value.forall(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))
+    )(value)
+
+extension (prefix: ObjectIdPrefix) def text: String = prefix
+
+given CanEqual[ObjectIdPrefix, ObjectIdPrefix] = CanEqual.derived
+
 /** A fully-qualified git ref name, e.g. `refs/heads/main`, `refs/tags/v1`, or
  *  the pseudo-ref `HEAD`. */
 opaque type RefName = String
@@ -88,12 +104,18 @@ final case class Branch(name: String, commit: ObjectId)
  *  an annotated-tag object for an annotated tag). */
 final case class Tag(name: String, target: ObjectId)
 
-/** The result of ref discovery (`GET /info/refs?service=git-upload-pack`). */
+/** The result of ref discovery (`GET /info/refs?service=git-upload-pack`).
+ *
+ *  `peeled` maps a ref name (e.g. `refs/tags/v1`) to the commit its
+ *  `^{}` peeled advertisement pointed at. Only annotated tags produce a
+ *  peeled entry; it lets callers resolve an annotated tag straight to its
+ *  target commit without a second round-trip to dereference the tag object. */
 final case class RefAdvertisement(
   refs: List[Ref],
   head: Option[ObjectId],
   headTarget: Option[RefName],
   capabilities: Set[String],
+  peeled: Map[RefName, ObjectId] = Map.empty,
 ):
   def branches: List[Branch] =
     refs.flatMap(r => r.name.branchName.map(Branch(_, r.target)))
@@ -103,6 +125,42 @@ final case class RefAdvertisement(
 
   def find(name: RefName): Option[Ref] =
     refs.find(_.name == name)
+
+  /** Resolve a ref name to the commit it ultimately points at, preferring an
+   *  annotated tag's peeled target over the (tag-object) ref target. Returns
+   *  `None` if the name isn't advertised. */
+  def resolveToCommit(name: RefName): Option[ObjectId] =
+    peeled.get(name).orElse(find(name).map(_.target))
+
+  /** Resolve forms that can be answered from the ref advertisement alone.
+   *  `None` means an abbreviated id may require fetching commit objects. */
+  def resolveAdvertisedCommittish(raw: String): Either[GitError, Option[ObjectId]] =
+    val committish = raw.trim
+    val branch =
+      committish
+        .stripPrefix("refs/remotes/origin/")
+        .stripPrefix("origin/")
+    val named =
+      Option.when(committish == "HEAD")(head).flatten
+        .orElse(resolveToCommit(RefName(s"${RefName.TagPrefix}$committish")))
+        .orElse(resolveToCommit(RefName(s"${RefName.HeadPrefix}$branch")))
+        .orElse(resolveToCommit(RefName(committish)))
+        .orElse(ObjectId.parse(committish))
+
+    named match
+      case some @ Some(_) => Right(some)
+      case None =>
+        ObjectIdPrefix.parse(committish) match
+          case None => Right(None)
+          case Some(prefix) =>
+            val candidates =
+              (head.toList ++ refs.flatMap(ref => resolveToCommit(ref.name)))
+                .distinct
+                .filter(_.hex.startsWith(prefix.text))
+            candidates match
+              case candidate :: Nil => Right(Some(candidate))
+              case Nil              => Right(None)
+              case _                => Left(GitError.AmbiguousObjectId(prefix))
 
 /** A fully-materialized git object: its type and its (delta-resolved) content
  *  bytes. `id` is the git object id derived from the content. */
@@ -147,6 +205,21 @@ object FileMode:
 
 given CanEqual[FileMode, FileMode] = CanEqual.derived
 
+/** Server-side object filtering for smart-HTTP fetches. */
+enum FetchFilter(val wireValue: String):
+  /** Fetch commits while omitting every tree and blob. */
+  case CommitsOnly extends FetchFilter("tree:0")
+
+given CanEqual[FetchFilter, FetchFilter] = CanEqual.derived
+
+/** Trade-off for fetching complete history. Minimal transfer omits trees and
+ *  blobs when supported; server default often allows hosted providers to serve
+ *  a cached pack with lower latency. */
+enum HistoryFetchMode:
+  case MinimalTransfer, ServerDefault
+
+given CanEqual[HistoryFetchMode, HistoryFetchMode] = CanEqual.derived
+
 /** One entry in a tree object. */
 final case class TreeEntry(mode: FileMode, name: String, id: ObjectId)
 
@@ -160,4 +233,5 @@ enum GitError:
   case ProtocolError(message: String)
   case ObjectNotFound(id: ObjectId)
   case RefNotFound(ref: String)
+  case AmbiguousObjectId(prefix: ObjectIdPrefix)
   case Transport(cause: Throwable)

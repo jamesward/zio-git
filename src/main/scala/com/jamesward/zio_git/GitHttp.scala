@@ -61,13 +61,20 @@ final case class GitHttp(client: Client):
    * the delta-resolved object map. `deepen` requests a shallow history of that
    * many commits.
    */
-  def fetchObjects(repo: RepoUrl, wants: List[ObjectId], deepen: Option[Int] = None): ZIO[Any, GitError, Map[ObjectId, RawObject]] =
+  def fetchObjects(
+    repo: RepoUrl,
+    wants: List[ObjectId],
+    deepen: Option[Int] = None,
+    filter: Option[FetchFilter] = None,
+    sideBand: Boolean = false,
+    ofsDelta: Boolean = false,
+  ): ZIO[Any, GitError, Map[ObjectId, RawObject]] =
     if wants.isEmpty then ZIO.fail(GitError.ProtocolError("fetch requires at least one want"))
     else
       defer:
         val urlStr = s"${repo.base}/git-upload-pack"
         val url = decodeUrl(urlStr).run
-        val reqBody = ZIO.succeed(GitHttp.buildFetchRequest(wants, deepen)).run
+        val reqBody = ZIO.succeed(GitHttp.buildFetchRequest(wants, deepen, filter, sideBand, ofsDelta)).run
         val request =
           ZIO.succeed(
             Request
@@ -79,7 +86,7 @@ final case class GitHttp(client: Client):
         val response = client.batched(request).mapError(GitError.Transport.apply).run
         ZIO.fail(GitError.HttpError(response.status.code, urlStr)).when(!response.status.isSuccess).run
         val body = response.body.asArray.mapError(GitError.Transport.apply).run
-        val pack = ZIO.fromEither(GitHttp.parseFetchResponse(body)).mapError(GitError.ProtocolError.apply).run
+        val pack = ZIO.fromEither(GitHttp.parseFetchResponse(body, sideBand)).mapError(GitError.ProtocolError.apply).run
         ZIO.fromEither(PackFile.parse(pack)).mapError(GitError.ProtocolError.apply).run
 
   /**
@@ -95,6 +102,22 @@ final case class GitHttp(client: Client):
   /** Convenience: list commits reachable from the default branch (HEAD). */
   def log(repo: RepoUrl, maxCount: Int = 50): ZIO[Any, GitError, List[Commit]] =
     headCommit(repo).flatMap(commitLog(repo, _, maxCount))
+
+  /** List every commit reachable from a branch. `MinimalTransfer` asks capable
+   *  servers to omit trees and blobs; `ServerDefault` accepts the provider's
+   *  normal pack, which can have lower latency when that pack is cached. Ref
+   *  discovery and branch resolution share one advertisement request. */
+  def fullBranchLog(
+    repo: RepoUrl,
+    branch: String,
+    mode: HistoryFetchMode = HistoryFetchMode.MinimalTransfer,
+  ): ZIO[Any, GitError, List[Commit]] =
+    defer:
+      val advertisement = refs(repo).run
+      val start = resolveBranch(advertisement, branch).run
+      val objects = fetchCommitObjects(repo, advertisement, List(start), mode).run
+      ZIO.fromEither(GitHttp.walkCommits(objects, start, Int.MaxValue))
+        .mapError(GitError.ProtocolError.apply).run
 
   /**
    * Clone the repository by fetching HEAD's full history and checking out
@@ -112,13 +135,40 @@ final case class GitHttp(client: Client):
 
   /** Resolve a branch's tip commit id, or HEAD's when `branch` is None. */
   def resolveCommit(repo: RepoUrl, branch: Option[String]): ZIO[Any, GitError, ObjectId] =
-    refs(repo).flatMap: adv =>
-      branch match
+    refs(repo).flatMap: advertisement =>
+      branch.fold(
+        ZIO.fromOption(advertisement.head).orElseFail(GitError.RefNotFound("HEAD"))
+      )(resolveBranch(advertisement, _))
+
+  /**
+   * Resolve a tag, branch, fully-qualified ref, HEAD, full object id, or unique
+   * abbreviated commit id. Annotated tags are peeled from the advertisement.
+   * Historical abbreviated ids require a commit-only fetch from all advertised
+   * branch tips; this expensive fallback is used only when refs cannot answer.
+   */
+  def resolveCommittish(repo: RepoUrl, committish: String): ZIO[Any, GitError, ObjectId] =
+    defer:
+      val advertisement = refs(repo).run
+      val advertised = ZIO.fromEither(advertisement.resolveAdvertisedCommittish(committish)).run
+      advertised match
+        case Some(commit) => commit
         case None =>
-          ZIO.fromOption(adv.head).orElseFail(GitError.RefNotFound("HEAD"))
-        case Some(b) =>
-          val name = RefName(s"${RefName.HeadPrefix}$b")
-          ZIO.fromOption(adv.find(name).map(_.target)).orElseFail(GitError.RefNotFound(name.value))
+          val prefix = ZIO.fromOption(ObjectIdPrefix.parse(committish))
+            .orElseFail(GitError.RefNotFound(committish)).run
+          val wants =
+            (advertisement.head.toList ++
+              advertisement.branches.map(_.commit) ++
+              advertisement.tags.map(_.target) ++
+              advertisement.peeled.values).distinct
+          ZIO.fail(GitError.RefNotFound(committish)).when(wants.isEmpty).run
+          val objects = fetchCommitObjects(repo, advertisement, wants, HistoryFetchMode.MinimalTransfer).run
+          val matches = objects.collect:
+            case (id, obj) if obj.objType == GitObjectType.Commit && id.hex.startsWith(prefix.text) => id
+          .toList
+          matches match
+            case commit :: Nil => commit
+            case Nil           => ZIO.fail(GitError.RefNotFound(committish)).run
+            case _             => ZIO.fail(GitError.AmbiguousObjectId(prefix)).run
 
   /**
    * Read every file in `commit`'s tree into memory, keyed by repo-relative path
@@ -132,6 +182,26 @@ final case class GitHttp(client: Client):
       val commitObj = ZIO.fromOption(objects.get(commit)).orElseFail(GitError.ObjectNotFound(commit)).run
       val c = ZIO.fromEither(GitObjects.parseCommit(commitObj)).mapError(GitError.ProtocolError.apply).run
       ZIO.fromEither(GitHttp.collectTree(objects, c.tree, "")).mapError(GitError.ProtocolError.apply).run
+
+  private def resolveBranch(advertisement: RefAdvertisement, branch: String): IO[GitError, ObjectId] =
+    val normalized = branch.stripPrefix("refs/remotes/origin/").stripPrefix("origin/").stripPrefix(RefName.HeadPrefix)
+    val name = RefName(s"${RefName.HeadPrefix}$normalized")
+    ZIO.fromOption(advertisement.resolveToCommit(name)).orElseFail(GitError.RefNotFound(name.value))
+
+  private def fetchCommitObjects(
+    repo: RepoUrl,
+    advertisement: RefAdvertisement,
+    wants: List[ObjectId],
+    mode: HistoryFetchMode,
+  ): ZIO[Any, GitError, Map[ObjectId, RawObject]] =
+    val filter = mode match
+      case HistoryFetchMode.MinimalTransfer =>
+        Option.when(advertisement.capabilities.contains("filter"))(FetchFilter.CommitsOnly)
+      case HistoryFetchMode.ServerDefault => None
+    val filtered = filter.isDefined
+    val sideBand = filtered && advertisement.capabilities.contains("side-band-64k")
+    val ofsDelta = filtered && advertisement.capabilities.contains("ofs-delta")
+    fetchObjects(repo, wants, filter = filter, sideBand = sideBand, ofsDelta = ofsDelta)
 
   private def checkoutTree(objects: Map[ObjectId, RawObject], treeId: ObjectId, dir: File): ZIO[Any, GitError, Int] =
     defer:
@@ -175,8 +245,14 @@ object GitHttp:
   def tags(repo: RepoUrl): ZIO[GitHttp, GitError, List[Tag]] = ZIO.serviceWithZIO(_.tags(repo))
   def headCommit(repo: RepoUrl): ZIO[GitHttp, GitError, ObjectId] = ZIO.serviceWithZIO(_.headCommit(repo))
   def log(repo: RepoUrl, maxCount: Int = 50): ZIO[GitHttp, GitError, List[Commit]] = ZIO.serviceWithZIO(_.log(repo, maxCount))
+  def fullBranchLog(
+    repo: RepoUrl,
+    branch: String,
+    mode: HistoryFetchMode = HistoryFetchMode.MinimalTransfer,
+  ): ZIO[GitHttp, GitError, List[Commit]] = ZIO.serviceWithZIO(_.fullBranchLog(repo, branch, mode))
   def cloneRepo(repo: RepoUrl, dest: File): ZIO[GitHttp, GitError, CloneResult] = ZIO.serviceWithZIO(_.cloneRepo(repo, dest))
   def resolveCommit(repo: RepoUrl, branch: Option[String]): ZIO[GitHttp, GitError, ObjectId] = ZIO.serviceWithZIO(_.resolveCommit(repo, branch))
+  def resolveCommittish(repo: RepoUrl, committish: String): ZIO[GitHttp, GitError, ObjectId] = ZIO.serviceWithZIO(_.resolveCommittish(repo, committish))
   def readFiles(repo: RepoUrl, commit: ObjectId): ZIO[GitHttp, GitError, Map[String, Chunk[Byte]]] = ZIO.serviceWithZIO(_.readFiles(repo, commit))
 
   /** Recursively collect every blob under `treeId` into a path->bytes map,
@@ -203,20 +279,40 @@ object GitHttp:
                     case Some(blob) => Right(acc + (s"$prefix${entry.name}" -> blob.data))
                     case None       => Left(s"missing blob ${entry.id.hex} for $prefix${entry.name}")
 
-  /** Build a `git-upload-pack` request body: `want` lines, an optional
-   *  `deepen`, a flush, then `done`. */
-  def buildFetchRequest(wants: List[ObjectId], deepen: Option[Int]): Array[Byte] =
-    val wantLines = wants.map(w => PktLine.encodeLine(s"want ${w.hex}\n"))
+  /** Build a `git-upload-pack` request body. Protocol-v0 capabilities belong
+   *  only on the first `want`; object filters additionally require a `filter`
+   *  command before the flush. */
+  def buildFetchRequest(
+    wants: List[ObjectId],
+    deepen: Option[Int],
+    filter: Option[FetchFilter] = None,
+    sideBand: Boolean = false,
+    ofsDelta: Boolean = false,
+  ): Array[Byte] =
+    val requestedCapabilities =
+      List(
+        Option.when(filter.isDefined)("filter"),
+        Option.when(sideBand)("side-band-64k"),
+        Option.when(ofsDelta)("ofs-delta"),
+      ).flatten
+    val wantLines = wants.zipWithIndex.map: (want, index) =>
+      val capabilities =
+        Option.when(index == 0 && requestedCapabilities.nonEmpty)(" " + requestedCapabilities.mkString(" "))
+          .getOrElse("")
+      PktLine.encodeLine(s"want ${want.hex}$capabilities\n")
     val deepenLine = deepen.map(d => PktLine.encodeLine(s"deepen $d\n")).toList
+    val filterLine = filter.map(value => PktLine.encodeLine(s"filter ${value.wireValue}\n")).toList
     val trailer = List(PktLine.flush, PktLine.encodeLine("done\n"))
-    (wantLines ++ deepenLine ++ trailer).reduce(_ ++ _)
+    (wantLines ++ deepenLine ++ filterLine ++ trailer).foldLeft(Array.emptyByteArray)(_ ++ _)
 
-  /**
-   * Parse a `git-upload-pack` response into the raw packfile bytes. We advertise
-   * no `side-band` capability, so after the negotiation pkt-lines (`shallow`
-   * updates and the terminating `NAK`/`ACK`) the packfile follows verbatim.
-   */
-  def parseFetchResponse(bytes: Array[Byte]): Either[String, Array[Byte]] =
+  /** Parse a `git-upload-pack` response into raw packfile bytes. When
+   *  `sideBand` is enabled, channel 1 is pack data, channel 2 is progress
+   *  (discarded), and channel 3 is a server error. */
+  def parseFetchResponse(bytes: Array[Byte], sideBand: Boolean = false): Either[String, Array[Byte]] =
+    def packAfter(pos: Int): Either[String, Array[Byte]] =
+      if sideBand then parseSideBand(bytes, pos)
+      else Right(bytes.drop(pos))
+
     def loop(pos: Int): Either[String, Array[Byte]] =
       if pos >= bytes.length then Left("no NAK/ACK terminator before packfile")
       else
@@ -226,11 +322,28 @@ object GitHttp:
             frame match
               case PktLine.Frame.Data(payload) =>
                 val text = String(payload, StandardCharsets.US_ASCII)
-                if text.startsWith("NAK") || text.startsWith("ACK") then Right(bytes.drop(next))
+                if text.startsWith("NAK") || text.startsWith("ACK") then packAfter(next)
                 else if text.startsWith("ERR ") then Left(s"server error: ${text.stripPrefix("ERR ").trim}")
                 else loop(next) // shallow / unshallow lines
               case _ => loop(next)
     loop(0)
+
+  private def parseSideBand(bytes: Array[Byte], start: Int): Either[String, Array[Byte]] =
+    def loop(pos: Int, pack: Chunk[Byte]): Either[String, Array[Byte]] =
+      if pos >= bytes.length then Right(pack.toArray)
+      else
+        PktLine.readFrame(bytes, pos) match
+          case Left(error) => Left(error)
+          case Right((PktLine.Frame.Data(payload), next)) if payload.nonEmpty =>
+            payload.head match
+              case 1 => loop(next, pack ++ Chunk.fromArray(payload.drop(1)))
+              case 2 => loop(next, pack)
+              case 3 => Left(s"server side-band error: ${String(payload.drop(1), StandardCharsets.UTF_8).trim}")
+              case channel => Left(s"unknown side-band channel: $channel")
+          case Right((PktLine.Frame.Data(_), _)) => Left("empty side-band packet")
+          case Right((_, _))                    => Right(pack.toArray)
+
+    loop(start, Chunk.empty)
 
   /** Parse an `info/refs` advertisement into a [[RefAdvertisement]]. */
   def parseAdvertisement(bytes: Array[Byte]): Either[String, RefAdvertisement] =
@@ -253,11 +366,16 @@ object GitHttp:
       // Drop peeled tag entries ("refs/tags/x^{}") and the HEAD pseudo-ref.
       val refs = ordered.collect:
         case (id, name) if name != RefName.Head && !name.value.endsWith("^{}") => Ref(name, id)
+      // Peeled entries ("refs/tags/x^{}") carry the *commit* an annotated tag
+      // resolves to; key them by the base ref name (without the "^{}" suffix).
+      val peeled = ordered.collect:
+        case (id, name) if name.value.endsWith("^{}") => RefName(name.value.stripSuffix("^{}")) -> id
+      .toMap
       val head = ordered.collectFirst { case (id, name) if name == RefName.Head => id }
       val headTarget = capabilities
         .collectFirst { case c if c.startsWith("symref=HEAD:") => RefName(c.stripPrefix("symref=HEAD:")) }
 
-      Right(RefAdvertisement(refs, head, headTarget, capabilities))
+      Right(RefAdvertisement(refs, head, headTarget, capabilities, peeled))
 
   private def parseRefLine(refPart: String): Option[(ObjectId, RefName)] =
     val space = refPart.indexOf(' ')

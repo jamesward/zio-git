@@ -1,25 +1,34 @@
 zio-git
 --------------------
 
+[![javadocs.dev](https://www.javadocs.dev/com.jamesward/zio-git_3/badge.svg)](https://www.javadocs.dev/com.jamesward/zio-git_3/latest)
+
 A small ZIO 2 / Scala 3 client for reading remote git repositories over the
 **smart HTTP** protocol (`git-upload-pack`), built on [zio-http].
 
 Scope: read-only, HTTP(S) transport only, **no authentication** (public repos).
-It speaks protocol v0, requests no `side-band`, and parses self-contained
-(non-thin) packfiles.
+It speaks protocol v0, negotiates side-band/filter/delta capabilities when
+requested, and parses self-contained (non-thin) packfiles.
 
 ### Features
 
 - **Ref discovery** (`refs`) — one `GET /info/refs?service=git-upload-pack`
   parsed into a typed `RefAdvertisement`: every `Ref`, the HEAD object id, the
   HEAD symref target, and the server capability set. Convenience views:
-  `branches` (from `refs/heads/`) and `tags` (from `refs/tags/`, peeled
-  entries dropped).
+  `branches` (from `refs/heads/`) and `tags` (from `refs/tags/`, with
+  annotated-tag commit targets retained in `peeled`).
 - **Fetch** (`fetchObjects`) — `POST /git-upload-pack` for a set of `want`s
-  (optionally shallow via `deepen`), returning a delta-resolved
+  (optionally shallow or server-filtered), returning a delta-resolved
   `Map[ObjectId, RawObject]`. Handles both `OFS_DELTA` and `REF_DELTA`.
-- **Commit log** (`commitLog` / `log`) — shallow-fetch a slice and walk the
-  parent graph, newest first, stopping at the shallow boundary.
+- **Commit log** (`commitLog` / `log` / `fullBranchLog`) — shallow-fetch a
+  slice or walk complete branch history. Callers choose `MinimalTransfer`
+  (`filter tree:0` when supported) or `ServerDefault` (often a lower-latency
+  provider-cached pack).
+- **Committish resolution** (`resolveCommittish`) — resolves HEAD, branches,
+  `origin/*`, tags (including annotated tags), full ids, and unique abbreviated
+  commit ids.
+- **Gitignore matching** (`GitIgnore`) — pure ordered matching with negation,
+  globstars, anchoring, directory rules, and parent-directory semantics.
 - **Clone** (`cloneRepo`) — fetch HEAD's history and check out HEAD's tree into
   a directory (blobs written to disk, executable bit applied, submodules
   skipped).
