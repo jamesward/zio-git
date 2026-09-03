@@ -171,17 +171,71 @@ final case class GitHttp(client: Client):
             case _             => ZIO.fail(GitError.AmbiguousObjectId(prefix)).run
 
   /**
-   * Read every file in `commit`'s tree into memory, keyed by repo-relative path
-   * (e.g. `docs/intro.md`). Shallow-fetches just that commit (`deepen 1`), so no
-   * history is transferred and nothing is written to disk. Submodules (gitlinks)
-   * are skipped.
+   * Read every file in `commit`'s tree into memory, keyed by repo-relative path.
+   * Servers advertising partial-clone filters are read in bounded blob batches;
+   * other servers retain the original shallow full-tree fetch.
    */
   def readFiles(repo: RepoUrl, commit: ObjectId): ZIO[Any, GitError, Map[String, Chunk[Byte]]] =
+    readFilesAt(repo, commit, None)
+
+  /**
+   * Read only files beneath `path`, with keys relative to that subtree. On a
+   * server advertising `filter`, the first fetch requests `blob:none`; after
+   * locating the subtree from the returned trees, only its blobs are fetched.
+   */
+  def readFilesUnder(repo: RepoUrl, commit: ObjectId, path: RepoPath): ZIO[Any, GitError, Map[String, Chunk[Byte]]] =
+    readFilesAt(repo, commit, Some(path))
+
+  private def readFilesAt(
+    repo: RepoUrl,
+    commit: ObjectId,
+    path: Option[RepoPath],
+  ): ZIO[Any, GitError, Map[String, Chunk[Byte]]] =
+    defer:
+      val advertisement = refs(repo).run
+      if advertisement.capabilities.contains("filter") then
+        readFilesSparse(repo, commit, path, advertisement).run
+      else
+        val all = readFilesFull(repo, commit).run
+        path.fold(all)(p => GitHttp.selectSubtree(all, p))
+
+  private def readFilesFull(repo: RepoUrl, commit: ObjectId): ZIO[Any, GitError, Map[String, Chunk[Byte]]] =
     defer:
       val objects = fetchObjects(repo, List(commit), Some(1)).run
       val commitObj = ZIO.fromOption(objects.get(commit)).orElseFail(GitError.ObjectNotFound(commit)).run
-      val c = ZIO.fromEither(GitObjects.parseCommit(commitObj)).mapError(GitError.ProtocolError.apply).run
-      ZIO.fromEither(GitHttp.collectTree(objects, c.tree, "")).mapError(GitError.ProtocolError.apply).run
+      val parsed = ZIO.fromEither(GitObjects.parseCommit(commitObj)).mapError(GitError.ProtocolError.apply).run
+      ZIO.fromEither(GitHttp.collectTree(objects, parsed.tree, "")).mapError(GitError.ProtocolError.apply).run
+
+  private def readFilesSparse(
+    repo: RepoUrl,
+    commit: ObjectId,
+    path: Option[RepoPath],
+    advertisement: RefAdvertisement,
+  ): ZIO[Any, GitError, Map[String, Chunk[Byte]]] =
+    defer:
+      val sideBand = advertisement.capabilities.contains("side-band-64k")
+      val ofsDelta = advertisement.capabilities.contains("ofs-delta")
+      val trees = fetchObjects(
+        repo,
+        List(commit),
+        deepen = Some(1),
+        filter = Some(FetchFilter.BlobsNone),
+        sideBand = sideBand,
+        ofsDelta = ofsDelta,
+      ).run
+      val commitObj = ZIO.fromOption(trees.get(commit)).orElseFail(GitError.ObjectNotFound(commit)).run
+      val parsed = ZIO.fromEither(GitObjects.parseCommit(commitObj)).mapError(GitError.ProtocolError.apply).run
+      val subtree = ZIO.fromEither(GitHttp.resolveSubtree(trees, parsed.tree, path))
+        .mapError(GitError.ProtocolError.apply).run
+      val entries = ZIO.fromEither(GitHttp.collectBlobEntries(trees, subtree, ""))
+        .mapError(GitError.ProtocolError.apply).run
+      val blobIds = entries.map(_._2).distinct
+      val batches = ZIO.succeed(blobIds.grouped(GitHttp.BlobBatchSize).toList).run
+      val fetched = ZIO.foreach(batches): batch =>
+        fetchObjects(repo, batch, sideBand = sideBand, ofsDelta = ofsDelta)
+      .map(_.foldLeft(Map.empty[ObjectId, RawObject])(_ ++ _)).run
+      ZIO.fromEither(GitHttp.materializeBlobEntries(fetched, entries))
+        .mapError(GitError.ProtocolError.apply).run
 
   private def resolveBranch(advertisement: RefAdvertisement, branch: String): IO[GitError, ObjectId] =
     val normalized = branch.stripPrefix("refs/remotes/origin/").stripPrefix("origin/").stripPrefix(RefName.HeadPrefix)
@@ -254,6 +308,60 @@ object GitHttp:
   def resolveCommit(repo: RepoUrl, branch: Option[String]): ZIO[GitHttp, GitError, ObjectId] = ZIO.serviceWithZIO(_.resolveCommit(repo, branch))
   def resolveCommittish(repo: RepoUrl, committish: String): ZIO[GitHttp, GitError, ObjectId] = ZIO.serviceWithZIO(_.resolveCommittish(repo, committish))
   def readFiles(repo: RepoUrl, commit: ObjectId): ZIO[GitHttp, GitError, Map[String, Chunk[Byte]]] = ZIO.serviceWithZIO(_.readFiles(repo, commit))
+  def readFilesUnder(repo: RepoUrl, commit: ObjectId, path: RepoPath): ZIO[GitHttp, GitError, Map[String, Chunk[Byte]]] =
+    ZIO.serviceWithZIO(_.readFilesUnder(repo, commit, path))
+
+  private[zio_git] val BlobBatchSize = 256
+
+  private[zio_git] def selectSubtree(files: Map[String, Chunk[Byte]], path: RepoPath): Map[String, Chunk[Byte]] =
+    val prefix = path.value + "/"
+    files.collect:
+      case (name, bytes) if name.startsWith(prefix) => name.stripPrefix(prefix) -> bytes
+
+  private[zio_git] def resolveSubtree(
+    objects: Map[ObjectId, RawObject],
+    root: ObjectId,
+    path: Option[RepoPath],
+  ): Either[String, ObjectId] =
+    path.fold[Either[String, ObjectId]](Right(root)): repoPath =>
+      repoPath.segments.foldLeft[Either[String, ObjectId]](Right(root)):
+        case (Left(error), _) => Left(error)
+        case (Right(treeId), segment) =>
+          objects.get(treeId).toRight(s"missing tree object ${treeId.hex}").flatMap: treeObject =>
+            GitObjects.parseTree(treeObject).flatMap: tree =>
+              tree.entries
+                .find(entry => entry.mode == FileMode.Directory && entry.name == segment)
+                .map(_.id)
+                .toRight(s"repository path not found: ${repoPath.value}")
+
+  private[zio_git] def collectBlobEntries(
+    objects: Map[ObjectId, RawObject],
+    treeId: ObjectId,
+    prefix: String,
+  ): Either[String, List[(String, ObjectId)]] =
+    objects.get(treeId).toRight(s"missing tree object ${treeId.hex}").flatMap: treeObject =>
+      GitObjects.parseTree(treeObject).flatMap: tree =>
+        tree.entries.foldLeft[Either[String, List[(String, ObjectId)]]](Right(Nil)):
+          case (Left(error), _) => Left(error)
+          case (Right(entries), entry) =>
+            entry.mode match
+              case FileMode.Directory =>
+                collectBlobEntries(objects, entry.id, s"$prefix${entry.name}/").map(entries ++ _)
+              case FileMode.GitLink => Right(entries)
+              case FileMode.RegularFile | FileMode.ExecutableFile | FileMode.SymbolicLink =>
+                Right(entries :+ (s"$prefix${entry.name}" -> entry.id))
+
+  private[zio_git] def materializeBlobEntries(
+    objects: Map[ObjectId, RawObject],
+    entries: List[(String, ObjectId)],
+  ): Either[String, Map[String, Chunk[Byte]]] =
+    entries.foldLeft[Either[String, Map[String, Chunk[Byte]]]](Right(Map.empty)):
+      case (Left(error), _) => Left(error)
+      case (Right(files), (path, id)) =>
+        objects.get(id) match
+          case Some(blob) if blob.objType == GitObjectType.Blob => Right(files.updated(path, blob.data))
+          case Some(other) => Left(s"expected blob ${id.hex} for $path, got ${other.objType.token}")
+          case None => Left(s"missing blob ${id.hex} for $path")
 
   /** Recursively collect every blob under `treeId` into a path->bytes map,
    *  `prefix` being the accumulated directory path. Submodules are skipped. */

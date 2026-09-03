@@ -5,6 +5,26 @@ import zio.Chunk
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Instant
+import scala.annotation.targetName
+
+/** A non-empty repository-relative path used for sparse tree reads. */
+opaque type RepoPath = String
+
+object RepoPath:
+  def parse(raw: String): Either[String, RepoPath] =
+    val normalized = raw.trim.stripSuffix("/")
+    val segments = normalized.split("/", -1).toList
+    if normalized.isEmpty then Left("repository path must not be empty")
+    else if normalized.startsWith("/") || normalized.contains('\\') then Left("repository path must be relative and use forward slashes")
+    else if segments.exists(segment => segment.isEmpty || segment == "." || segment == "..") then Left("repository path contains an invalid segment")
+    else Right(normalized)
+
+extension (path: RepoPath)
+  @targetName("repoPathValue")
+  def value: String = path
+  private[zio_git] def segments: List[String] = path.split('/').toList
+
+given CanEqual[RepoPath, RepoPath] = CanEqual.derived
 
 /** A git object id: a 40-character lowercase hex SHA-1. Constructed only
  *  through [[ObjectId.parse]] / [[ObjectId.fromRawBytes]] so an in-flight value
@@ -209,6 +229,8 @@ given CanEqual[FileMode, FileMode] = CanEqual.derived
 enum FetchFilter(val wireValue: String):
   /** Fetch commits while omitting every tree and blob. */
   case CommitsOnly extends FetchFilter("tree:0")
+  /** Fetch commits and trees while omitting blob contents. */
+  case BlobsNone extends FetchFilter("blob:none")
 
 given CanEqual[FetchFilter, FetchFilter] = CanEqual.derived
 

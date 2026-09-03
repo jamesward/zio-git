@@ -27,6 +27,11 @@ requested, and parses self-contained (non-thin) packfiles.
 - **Committish resolution** (`resolveCommittish`) — resolves HEAD, branches,
   `origin/*`, tags (including annotated tags), full ids, and unique abbreviated
   commit ids.
+- **Sparse tree read** (`readFilesUnder`) — parse a safe `RepoPath`, fetch the
+  commit and tree graph with `filter blob:none`, then fetch only that subtree's
+  blobs in bounded batches. `readFiles` uses the same partial-clone path for the
+  full tree when the server advertises filtering, with a shallow-fetch fallback
+  for servers that do not.
 - **Gitignore matching** (`GitIgnore`) — pure ordered matching with negation,
   globstars, anchoring, directory rules, and parent-directory semantics.
 - **Clone** (`cloneRepo`) — fetch HEAD's history and check out HEAD's tree into
@@ -34,7 +39,7 @@ requested, and parses self-contained (non-thin) packfiles.
   skipped).
 
 Domain types are opaque and parsed-not-validated: `ObjectId` (40-hex SHA-1),
-`RefName`, `RepoUrl`. Objects are modeled as ADTs (`GitObjectType`, `Commit`,
+`RefName`, `RepoUrl`, and safe repository-relative `RepoPath`. Objects are modeled as ADTs (`GitObjectType`, `Commit`,
 `Tree`, `TreeEntry`, `FileMode`) and failures as a typed `GitError`.
 
 ### Usage

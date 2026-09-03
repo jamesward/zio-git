@@ -70,6 +70,30 @@ object GitHttpEnhancementsSpec extends ZIOSpecDefault:
         lines.lastOption.contains("done"),
       )
     ,
+    test("repository paths parse only safe relative subtrees"):
+      val valid = RepoPath.parse("docs/reference")
+      val invalid = List("", "/docs", "docs//reference", "docs/../reference", "docs\\reference")
+      assertTrue(
+        valid.exists(_.value == "docs/reference"),
+        invalid.forall(RepoPath.parse(_).isLeft),
+      )
+    ,
+    test("a blobless fetch advertises filter once and sends blob:none"):
+      val bytes = GitHttp.buildFetchRequest(
+        List(head),
+        deepen = Some(1),
+        filter = Some(FetchFilter.BlobsNone),
+        sideBand = true,
+        ofsDelta = true,
+      )
+      val lines = PktLine.decodeAll(bytes).toOption.get.collect:
+        case PktLine.Frame.Data(data) => String(data, StandardCharsets.US_ASCII).stripLineEnd
+      assertTrue(
+        lines.headOption.exists(_.startsWith(s"want ${head.hex} filter")),
+        lines.contains("deepen 1"),
+        lines.contains("filter blob:none"),
+      )
+    ,
     test("side-band parsing joins pack channel data and ignores progress"):
       val response =
         PktLine.encodeLine("NAK\n") ++

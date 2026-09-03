@@ -70,6 +70,18 @@ object GitHttpIntegrationSpec extends ZIOSpecDefault:
         val result = GitHttp.resolveCommit(repo, Some("no-such-branch-xyz")).either.run
         assertTrue(result.isLeft)
     ,
+    test("readFilesUnder fetches only a repository subtree with relative keys"):
+      defer:
+        val head = GitHttp.resolveCommit(repo, None).run
+        val path = RepoPath.parse("src/main").toOption.get
+        val files = GitHttp.readFilesUnder(repo, head, path).run
+        assertTrue(
+          files.nonEmpty,
+          files.keys.forall(name => !name.startsWith("src/main/")),
+          files.keys.exists(_.endsWith("MavenCentral.scala")),
+          !files.contains("build.sbt"),
+        )
+    ,
     test("readFiles reads the working tree at HEAD into memory (multi-object pack)"):
       defer:
         val head = GitHttp.resolveCommit(repo, None).run
