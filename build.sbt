@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-git"
 
-scalaVersion := "3.9.0"
+scalaVersion := "3.10.0"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
@@ -26,7 +26,7 @@ libraryDependencies ++= Seq(
 // The `Skills` config keeps them off the compile/runtime classpath.
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.4" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.11" % Skills
 
 fork := true
 
