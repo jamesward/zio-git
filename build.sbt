@@ -26,7 +26,7 @@ libraryDependencies ++= Seq(
 // The `Skills` config keeps them off the compile/runtime classpath.
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.11" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.13" % Skills
 
 fork := true
 
