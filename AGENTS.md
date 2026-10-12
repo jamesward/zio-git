@@ -22,6 +22,11 @@ To add more skills, browse https://skillsjars.com, add the dependency to
 `build.sbt` in the `Skills` config, then re-run extraction. `.kiro/skills` is
 gitignored — it is regenerated from the build.
 
+## Build and test
+
+Library project (no `stage`). Full validation: `./sbt "Test / compile; testFull"`. Tests marked
+integration talk to GitHub over the network.
+
 ## Agent tooling
 
 - Follow the `zen-of-projects` Skill (extract with `./sbt extractSkillsJars` into the gitignored `.kiro/skills/`); this file records only project-specific facts and exceptions.
