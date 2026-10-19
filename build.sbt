@@ -11,7 +11,7 @@ scalacOptions ++= Seq(
   // "-Xfatal-warnings", // not sure where it went
 )
 
-val zioVersion = "2.1.26"
+val zioVersion = "2.1.27"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"        % zioVersion,
@@ -26,7 +26,7 @@ libraryDependencies ++= Seq(
 // The `Skills` config keeps them off the compile/runtime classpath.
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.13" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.17" % Skills
 
 fork := true
 
